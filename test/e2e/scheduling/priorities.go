@@ -32,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
@@ -52,7 +53,7 @@ type Resource struct {
 	Memory   int64
 }
 
-var balancePodLabel = map[string]string{"name": "priority-balanced-memory"}
+var balancePodLabel = map[string]string{"podname": "priority-balanced-memory"}
 
 var podRequestedResource = &v1.ResourceRequirements{
 	Limits: v1.ResourceList{
@@ -187,7 +188,8 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 		}
 
 		// make the nodes have balanced cpu,mem usage
-		err = createBalancedPodForNodes(f, cs, ns, nodeList.Items, podRequestedResource, 0.6)
+		cleanUp, err := createBalancedPodForNodes(f, cs, ns, nodeList.Items, podRequestedResource, 0.6)
+		defer cleanUp()
 		framework.ExpectNoError(err)
 		ginkgo.By("Trying to launch the pod with podAntiAffinity.")
 		labelPodName := "pod-with-pod-antiaffinity"
@@ -236,7 +238,8 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 	ginkgo.It("Pod should avoid nodes that have avoidPod annotation", func() {
 		nodeName := nodeList.Items[0].Name
 		// make the nodes have balanced cpu,mem usage
-		err := createBalancedPodForNodes(f, cs, ns, nodeList.Items, podRequestedResource, 0.5)
+		cleanUp, err := createBalancedPodForNodes(f, cs, ns, nodeList.Items, podRequestedResource, 0.5)
+		defer cleanUp()
 		framework.ExpectNoError(err)
 		ginkgo.By("Create a RC, with 0 replicas")
 		rc := createRC(ns, "scheduler-priority-avoid-pod", int32(0), map[string]string{"name": "scheduler-priority-avoid-pod"}, f, podRequestedResource)
@@ -298,24 +301,46 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 
 	ginkgo.It("Pod should be preferably scheduled to nodes pod can tolerate", func() {
 		// make the nodes have balanced cpu,mem usage ratio
-		err := createBalancedPodForNodes(f, cs, ns, nodeList.Items, podRequestedResource, 0.5)
+		cleanUp, err := createBalancedPodForNodes(f, cs, ns, nodeList.Items, podRequestedResource, 0.5)
+		defer cleanUp()
 		framework.ExpectNoError(err)
 		// Apply 10 taints to first node
 		nodeName := nodeList.Items[0].Name
 
-		ginkgo.By("Trying to apply 10 (tolerable) taints on the first node.")
+		// First, create a set of tolerable taints (+tolerations) for the first node.
+		// Generate 10 tolerable taints for the first node (and matching tolerations)
+		tolerableTaints := make([]v1.Taint, 0)
 		var tolerations []v1.Toleration
 		for i := 0; i < 10; i++ {
-			testTaint := addRandomTaintToNode(cs, nodeName)
+			testTaint := getRandomTaint()
+			tolerableTaints = append(tolerableTaints, testTaint)
 			tolerations = append(tolerations, v1.Toleration{Key: testTaint.Key, Value: testTaint.Value, Effect: testTaint.Effect})
-			defer e2enode.RemoveTaintOffNode(cs, nodeName, *testTaint)
 		}
+		// Generate 10 intolerable taints for each of the remaining nodes
+		intolerableTaints := make(map[string][]v1.Taint)
+		for i := 1; i < len(nodeList.Items); i++ {
+			nodeTaints := make([]v1.Taint, 0)
+			for i := 0; i < 10; i++ {
+				nodeTaints = append(nodeTaints, getRandomTaint())
+			}
+			intolerableTaints[nodeList.Items[i].Name] = nodeTaints
+		}
+
+		// Apply the tolerable taints generated above to the first node
+		ginkgo.By("Trying to apply 10 (tolerable) taints on the first node.")
+		// We immediately defer the removal of these taints because addTaintToNode can
+		// panic and RemoveTaintsOffNode does not return an error if the taint does not exist.
+		defer e2enode.RemoveTaintsOffNode(cs, nodeName, tolerableTaints)
+		for _, taint := range tolerableTaints {
+			addTaintToNode(cs, nodeName, taint)
+		}
+		// Apply the intolerable taints to each of the following nodes
 		ginkgo.By("Adding 10 intolerable taints to all other nodes")
 		for i := 1; i < len(nodeList.Items); i++ {
 			node := nodeList.Items[i]
-			for i := 0; i < 10; i++ {
-				testTaint := addRandomTaintToNode(cs, node.Name)
-				defer e2enode.RemoveTaintOffNode(cs, node.Name, *testTaint)
+			defer e2enode.RemoveTaintsOffNode(cs, node.Name, intolerableTaints[node.Name])
+			for _, taint := range intolerableTaints[node.Name] {
+				addTaintToNode(cs, node.Name, taint)
 			}
 		}
 
@@ -360,7 +385,8 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 			}
 
 			// Make the nodes have balanced cpu,mem usage.
-			err := createBalancedPodForNodes(f, cs, ns, nodes, podRequestedResource, 0.5)
+			cleanUp, err := createBalancedPodForNodes(f, cs, ns, nodes, podRequestedResource, 0.5)
+			defer cleanUp()
 			framework.ExpectNoError(err)
 
 			replicas := 4
@@ -425,7 +451,34 @@ var _ = SIGDescribe("SchedulerPriorities [Serial]", func() {
 })
 
 // createBalancedPodForNodes creates a pod per node that asks for enough resources to make all nodes have the same mem/cpu usage ratio.
-func createBalancedPodForNodes(f *framework.Framework, cs clientset.Interface, ns string, nodes []v1.Node, requestedResource *v1.ResourceRequirements, ratio float64) error {
+func createBalancedPodForNodes(f *framework.Framework, cs clientset.Interface, ns string, nodes []v1.Node, requestedResource *v1.ResourceRequirements, ratio float64) (func(), error) {
+	cleanUp := func() {
+		// Delete all remaining pods
+		err := cs.CoreV1().Pods(ns).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{
+			LabelSelector: labels.SelectorFromSet(labels.Set(balancePodLabel)).String(),
+		})
+		if err != nil {
+			framework.Logf("Failed to delete memory balanced pods: %v.", err)
+		} else {
+			err := wait.PollImmediate(2*time.Second, time.Minute, func() (bool, error) {
+				podList, err := cs.CoreV1().Pods(ns).List(context.TODO(), metav1.ListOptions{
+					LabelSelector: labels.SelectorFromSet(labels.Set(balancePodLabel)).String(),
+				})
+				if err != nil {
+					framework.Logf("Failed to list memory balanced pods: %v.", err)
+					return false, nil
+				}
+				if len(podList.Items) > 0 {
+					return false, nil
+				}
+				return true, nil
+			})
+			if err != nil {
+				framework.Logf("Failed to wait until all memory balanced pods are deleted: %v.", err)
+			}
+		}
+	}
+
 	// find the max, if the node has the max,use the one, if not,use the ratio parameter
 	var maxCPUFraction, maxMemFraction float64 = ratio, ratio
 	var cpuFractionMap = make(map[string]float64)
@@ -485,7 +538,7 @@ func createBalancedPodForNodes(f *framework.Framework, cs clientset.Interface, n
 			*initPausePod(f, *podConfig), true, framework.Logf)
 
 		if err != nil {
-			return err
+			return cleanUp, err
 		}
 	}
 
@@ -494,7 +547,7 @@ func createBalancedPodForNodes(f *framework.Framework, cs clientset.Interface, n
 		computeCPUMemFraction(cs, node, requestedResource)
 	}
 
-	return nil
+	return cleanUp, nil
 }
 
 func computeCPUMemFraction(cs clientset.Interface, node v1.Node, resource *v1.ResourceRequirements) (float64, float64) {
@@ -582,13 +635,15 @@ func createRC(ns, rsName string, replicas int32, rcPodLabels map[string]string, 
 	return rc
 }
 
-func addRandomTaintToNode(cs clientset.Interface, nodeName string) *v1.Taint {
-	testTaint := v1.Taint{
-		Key:    fmt.Sprintf("kubernetes.io/e2e-taint-key-%s", string(uuid.NewUUID())),
+func getRandomTaint() v1.Taint {
+	return v1.Taint{
+		Key:    fmt.Sprintf("kubernetes.io/scheduling-priorities-e2e-taint-key-%s", string(uuid.NewUUID())),
 		Value:  fmt.Sprintf("testing-taint-value-%s", string(uuid.NewUUID())),
 		Effect: v1.TaintEffectPreferNoSchedule,
 	}
+}
+
+func addTaintToNode(cs clientset.Interface, nodeName string, testTaint v1.Taint) {
 	e2enode.AddOrUpdateTaintOnNode(cs, nodeName, testTaint)
 	framework.ExpectNodeHasTaint(cs, nodeName, &testTaint)
-	return &testTaint
 }

@@ -106,13 +106,14 @@ func (f *fakeImageGCManager) GetImageList() ([]kubecontainer.Image, error) {
 }
 
 type TestKubelet struct {
-	kubelet          *Kubelet
-	fakeRuntime      *containertest.FakeRuntime
-	fakeKubeClient   *fake.Clientset
-	fakeMirrorClient *podtest.FakeMirrorClient
-	fakeClock        *clock.FakeClock
-	mounter          mount.Interface
-	volumePlugin     *volumetest.FakeVolumePlugin
+	kubelet              *Kubelet
+	fakeRuntime          *containertest.FakeRuntime
+	fakeContainerManager *cm.FakeContainerManager
+	fakeKubeClient       *fake.Clientset
+	fakeMirrorClient     *podtest.FakeMirrorClient
+	fakeClock            *clock.FakeClock
+	mounter              mount.Interface
+	volumePlugin         *volumetest.FakeVolumePlugin
 }
 
 func (tk *TestKubelet) Cleanup() {
@@ -240,7 +241,8 @@ func newTestKubeletWithImageList(
 	kubelet.livenessManager = proberesults.NewManager()
 	kubelet.startupManager = proberesults.NewManager()
 
-	kubelet.containerManager = cm.NewStubContainerManager()
+	fakeContainerManager := cm.NewFakeContainerManager()
+	kubelet.containerManager = fakeContainerManager
 	fakeNodeRef := &v1.ObjectReference{
 		Kind:      "Node",
 		Name:      testKubeletHostname,
@@ -349,7 +351,7 @@ func newTestKubeletWithImageList(
 
 	kubelet.AddPodSyncLoopHandler(activeDeadlineHandler)
 	kubelet.AddPodSyncHandler(activeDeadlineHandler)
-	return &TestKubelet{kubelet, fakeRuntime, fakeKubeClient, fakeMirrorClient, fakeClock, nil, plug}
+	return &TestKubelet{kubelet, fakeRuntime, fakeContainerManager, fakeKubeClient, fakeMirrorClient, fakeClock, nil, plug}
 }
 
 func newTestPods(count int) []*v1.Pod {
@@ -403,6 +405,69 @@ func TestSyncPodsStartPod(t *testing.T) {
 	kubelet.podManager.SetPods(pods)
 	kubelet.HandlePodSyncs(pods)
 	fakeRuntime.AssertStartedPods([]string{string(pods[0].UID)})
+}
+
+func TestSyncPodsDeletesWhenSourcesAreReadyPerQOS(t *testing.T) {
+	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	go testKubelet.kubelet.podKiller.PerformPodKillingWork()
+	defer testKubelet.Cleanup()
+	defer testKubelet.kubelet.podKiller.Close()
+
+	pod := &kubecontainer.Pod{
+		ID:        "12345678",
+		Name:      "foo",
+		Namespace: "new",
+		Containers: []*kubecontainer.Container{
+			{Name: "bar"},
+		},
+	}
+
+	fakeRuntime := testKubelet.fakeRuntime
+	fakeContainerManager := testKubelet.fakeContainerManager
+	fakeContainerManager.PodContainerManager.AddPodFromCgroups(pod) // add pod to mock cgroup
+	fakeRuntime.PodList = []*containertest.FakePod{
+		{Pod: pod},
+	}
+	kubelet := testKubelet.kubelet
+	kubelet.cgroupsPerQOS = true // enable cgroupsPerQOS to turn on the cgroups cleanup
+	kubelet.sourcesReady = config.NewSourcesReady(func(_ sets.String) bool { return true })
+
+	// HandlePodCleanups gets called every 2 seconds within the Kubelet's
+	// housekeeping routine. This test registers the pod, removes the unwanted pod, then calls into
+	// HandlePodCleanups a few more times. We should only see one Destroy() event. podKiller runs
+	// within a goroutine so a two second delay should be enough time to
+	// mark the pod as killed (within this test case).
+
+	kubelet.HandlePodCleanups()
+	time.Sleep(2 * time.Second)
+
+	// assert that unwanted pods were killed
+	fakeRuntime.AssertKilledPods([]string{"12345678"})
+
+	kubelet.HandlePodCleanups()
+	kubelet.HandlePodCleanups()
+	kubelet.HandlePodCleanups()
+	time.Sleep(2 * time.Second)
+
+	destroyCount := 0
+	err := wait.Poll(100*time.Millisecond, 10*time.Second, func() (bool, error) {
+		fakeContainerManager.PodContainerManager.Lock()
+		defer fakeContainerManager.PodContainerManager.Unlock()
+		destroyCount = 0
+		for _, functionName := range fakeContainerManager.PodContainerManager.CalledFunctions {
+			if functionName == "Destroy" {
+				destroyCount = destroyCount + 1
+			}
+		}
+		return destroyCount >= 1, nil
+	})
+
+	assert.NoError(t, err, "wait should not return error")
+	// housekeeping can get called multiple times. The cgroup Destroy() is
+	// done within a goroutine and can get called multiple times, so the
+	// Destroy() count in not deterministic on the actual number.
+	// https://github.com/kubernetes/kubernetes/blob/29fdbb065b5e0d195299eb2d260b975cbc554673/pkg/kubelet/kubelet_pods.go#L2006
+	assert.True(t, destroyCount >= 1, "Expect 1 or more destroys")
 }
 
 func TestSyncPodsDeletesWhenSourcesAreReady(t *testing.T) {
@@ -1456,8 +1521,6 @@ func verifyContainerStatuses(t *testing.T, statuses []v1.ContainerStatus, state,
 // Test generateAPIPodStatus with different reason cache and old api pod status.
 func TestGenerateAPIPodStatusWithReasonCache(t *testing.T) {
 	// The following waiting reason and message  are generated in convertStatusToAPIStatus()
-	startWaitingReason := "ContainerCreating"
-	initWaitingReason := "PodInitializing"
 	testTimestamp := time.Unix(123456789, 987654321)
 	testErrorReason := fmt.Errorf("test-error")
 	emptyContainerID := (&kubecontainer.ContainerID{}).String()
@@ -1494,18 +1557,18 @@ func TestGenerateAPIPodStatusWithReasonCache(t *testing.T) {
 			}},
 			expectedState: map[string]v1.ContainerState{
 				"without-old-record": {Waiting: &v1.ContainerStateWaiting{
-					Reason: startWaitingReason,
+					Reason: ContainerCreating,
 				}},
 				"with-old-record": {Waiting: &v1.ContainerStateWaiting{
-					Reason: startWaitingReason,
+					Reason: ContainerCreating,
 				}},
 			},
 			expectedInitState: map[string]v1.ContainerState{
 				"without-old-record": {Waiting: &v1.ContainerStateWaiting{
-					Reason: initWaitingReason,
+					Reason: PodInitializing,
 				}},
 				"with-old-record": {Waiting: &v1.ContainerStateWaiting{
-					Reason: initWaitingReason,
+					Reason: PodInitializing,
 				}},
 			},
 			expectedLastTerminationState: map[string]v1.ContainerState{

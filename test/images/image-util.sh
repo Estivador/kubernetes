@@ -18,8 +18,8 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-TASK=$1
-WHAT=$2
+TASK=${1}
+WHAT=${2}
 
 # docker buildx command is still experimental as of Docker 19.03.0
 export DOCKER_CLI_EXPERIMENTAL="enabled"
@@ -51,30 +51,30 @@ initWindowsOsVersions
 
 # Returns list of all supported architectures from BASEIMAGE file
 listOsArchs() {
-  image=$1
+  local image=${1}
   cut -d "=" -f 1 "${image}"/BASEIMAGE
 }
 
 splitOsArch() {
-    image=$1
-    os_arch=$2
+  local image=${1}
+  local os_arch=${2}
 
-    if [[ $os_arch =~ .*/.*/.* ]]; then
-      # for Windows, we have to support both LTS and SAC channels, so we're building multiple Windows images.
-      # the format for this case is: OS/ARCH/OS_VERSION.
-      os_name=$(echo "$os_arch" | cut -d "/" -f 1)
-      arch=$(echo "$os_arch" | cut -d "/" -f 2)
-      os_version=$(echo "$os_arch" | cut -d "/" -f 3)
-      suffix="$os_name-$arch-$os_version"
-    elif [[ $os_arch =~ .*/.* ]]; then
-      os_name=$(echo "$os_arch" | cut -d "/" -f 1)
-      arch=$(echo "$os_arch" | cut -d "/" -f 2)
-      os_version=""
-      suffix="$os_name-$arch"
-    else
-      echo "The BASEIMAGE file for the ${image} image is not properly formatted. Expected entries to start with 'os/arch', found '${os_arch}' instead."
-      exit 1
-    fi
+  if [[ $os_arch =~ .*/.*/.* ]]; then
+    # for Windows, we have to support both LTS and SAC channels, so we're building multiple Windows images.
+    # the format for this case is: OS/ARCH/OS_VERSION.
+    os_name=$(echo "$os_arch" | cut -d "/" -f 1)
+    arch=$(echo "$os_arch" | cut -d "/" -f 2)
+    os_version=$(echo "$os_arch" | cut -d "/" -f 3)
+    suffix="$os_name-$arch-$os_version"
+  elif [[ $os_arch =~ .*/.* ]]; then
+    os_name=$(echo "$os_arch" | cut -d "/" -f 1)
+    arch=$(echo "$os_arch" | cut -d "/" -f 2)
+    os_version=""
+    suffix="$os_name-$arch"
+  else
+    echo "The BASEIMAGE file for the ${image} image is not properly formatted. Expected entries to start with 'os/arch', found '${os_arch}' instead."
+    exit 1
+  fi
 }
 
 # Returns baseimage need to used in Dockerfile for any given architecture
@@ -88,15 +88,25 @@ getBaseImage() {
 # it will build for all the supported arch list - amd64, arm,
 # arm64, ppc64le, s390x
 build() {
-  image=$1
-  output_type=$2
+  local image=${1}
+  local img_folder=${1}
+  local output_type=${2}
   docker_version_check
 
-  if [[ -f ${image}/BASEIMAGE ]]; then
+  if [[ -f "${img_folder}/BASEIMAGE" ]]; then
     os_archs=$(listOsArchs "$image")
   else
     # prepend linux/ to the QEMUARCHS items.
-    os_archs=$(printf 'linux/%s\n' "${!QEMUARCHS[*]}")
+    os_archs=$(printf 'linux/%s\n' "${!QEMUARCHS[@]}")
+  fi
+
+  # image tag
+  TAG=$(<"${img_folder}/VERSION")
+
+  alias_name="$(cat "${img_folder}/ALIAS" 2>/dev/null || true)"
+  if [[ -n "${alias_name}" ]]; then
+    echo "Found an alias for '${image}'. Building / tagging image as '${alias_name}.'"
+    image="${alias_name}"
   fi
 
   kube::util::ensure-gnu-sed
@@ -116,27 +126,25 @@ build() {
     temp_dir=$(mktemp -d "${KUBE_ROOT}"/_tmp/test-images-build.XXXXXX)
     kube::util::trap_add "rm -rf ${temp_dir}" EXIT
 
-    cp -r "${image}"/* "${temp_dir}"
-    if [[ -f ${image}/Makefile ]]; then
+    cp -r "${img_folder}"/* "${temp_dir}"
+    if [[ -f ${img_folder}/Makefile ]]; then
       # make bin will take care of all the prerequisites needed
       # for building the docker image
-      make -C "${image}" bin OS="${os_name}" ARCH="${arch}" TARGET="${temp_dir}"
+      make -C "${img_folder}" bin OS="${os_name}" ARCH="${arch}" TARGET="${temp_dir}"
     fi
     pushd "${temp_dir}"
-    # image tag
-    TAG=$(<VERSION)
 
+    # NOTE(claudiub): Some Windows images might require their own Dockerfile
+    # while simpler ones will not. If we're building for Windows, check if
+    # "Dockerfile_windows" exists or not.
+    dockerfile_name="Dockerfile"
+    if [[ "$os_name" = "windows" && -f "Dockerfile_windows" ]]; then
+      dockerfile_name="Dockerfile_windows"
+    fi
+
+    base_image=""
     if [[ -f BASEIMAGE ]]; then
-      BASEIMAGE=$(getBaseImage "${os_arch}" | ${SED} "s|REGISTRY|${REGISTRY}|g")
-
-      # NOTE(claudiub): Some Windows images might require their own Dockerfile
-      # while simpler ones will not. If we're building for Windows, check if
-      # "Dockerfile_windows" exists or not.
-      dockerfile_name="Dockerfile"
-      if [[ "$os_name" = "windows" && -f "Dockerfile_windows" ]]; then
-        dockerfile_name="Dockerfile_windows"
-      fi
-
+      base_image=$(getBaseImage "${os_arch}" | ${SED} "s|REGISTRY|${REGISTRY}|g")
       ${SED} -i "s|BASEARCH|${arch}|g" $dockerfile_name
     fi
 
@@ -160,8 +168,8 @@ build() {
       fi
     fi
 
-    docker buildx build --no-cache --pull --output=type="${output_type}" --platform "${os_name}/${arch}" \
-        --build-arg BASEIMAGE="${BASEIMAGE}" --build-arg REGISTRY="${REGISTRY}" --build-arg OS_VERSION="${os_version}" \
+    docker buildx build --progress=plain --no-cache --pull --output=type="${output_type}" --platform "${os_name}/${arch}" \
+        --build-arg BASEIMAGE="${base_image}" --build-arg REGISTRY="${REGISTRY}" --build-arg OS_VERSION="${os_version}" \
         -t "${REGISTRY}/${image}:${TAG}-${suffix}" -f "${dockerfile_name}" .
 
     popd
@@ -179,7 +187,7 @@ docker_version_check() {
 
 # This function will push the docker images
 push() {
-  image=$1
+  local image=${1}
   docker_version_check
 
   TAG=$(<"${image}"/VERSION)
@@ -187,7 +195,14 @@ push() {
     os_archs=$(listOsArchs "$image")
   else
     # prepend linux/ to the QEMUARCHS items.
-    os_archs=$(printf 'linux/%s\n' "${!QEMUARCHS[*]}")
+    os_archs=$(printf 'linux/%s\n' "${!QEMUARCHS[@]}")
+  fi
+
+  pushd "${image}"
+  alias_name="$(cat ALIAS 2>/dev/null || true)"
+  if [[ -n "${alias_name}" ]]; then
+    echo "Found an alias for '${image}'. Pushing image as '${alias_name}.'"
+    image="${alias_name}"
   fi
 
   kube::util::ensure-gnu-sed
@@ -223,13 +238,14 @@ push() {
         "${HOME}/.docker/manifests/${manifest_image_folder}/${manifest_image_folder}-${suffix}"
     fi
   done
+  popd
   docker manifest push --purge "${REGISTRY}/${image}:${TAG}"
 }
 
 # This function is for building AND pushing images. Useful if ${WHAT} is "all-conformance".
 # This will allow images to be pushed immediately after they've been built.
 build_and_push() {
-  image=$1
+  local image=${1}
   build "${image}" "registry"
   push "${image}"
 }

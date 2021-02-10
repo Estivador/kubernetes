@@ -1621,6 +1621,14 @@
     DNS configuration MUST be configured in the Pod.
   release: v1.17
   file: test/e2e/network/dns.go
+- testname: Scheduling, HostPort matching and HostIP and Protocol not-matching
+  codename: '[sig-network] HostPort validates that there is no conflict between pods
+    with same hostPort but different hostIP and protocol [LinuxOnly] [Conformance]'
+  description: Pods with the same HostPort value MUST be able to be scheduled to the
+    same node if the HostIP or Protocol is different. This test is marked LinuxOnly
+    since hostNetwork is not supported on Windows.
+  release: v1.16, v1.20
+  file: test/e2e/network/hostport.go
 - testname: Ingress API
   codename: '[sig-network] Ingress API should support creating Ingress API operations
     [Conformance]'
@@ -1694,6 +1702,14 @@
     other platforms like Windows.
   release: v1.9
   file: test/e2e/common/networking.go
+- testname: Proxy, validate ProxyWithPath responses
+  codename: '[sig-network] Proxy version v1 A set of valid responses are returned
+    for both pod and service ProxyWithPath [Conformance]'
+  description: Attempt to create a pod and a service. A set of pod and service endpoints
+    MUST be accessed via ProxyWithPath using a list of http methods. A valid response
+    MUST be returned for each endpoint.
+  release: v1.21
+  file: test/e2e/network/proxy.go
 - testname: Proxy, logs service endpoint
   codename: '[sig-network] Proxy version v1 should proxy through a service and a pod  [Conformance]'
   description: Select any node in the cluster to invoke  /logs endpoint  using the
@@ -2028,15 +2044,6 @@
   description: Pods with the same HostPort and Protocol, but different HostIPs, MUST
     NOT schedule to the same node if one of those IPs is the default HostIP of 0.0.0.0,
     which represents all IPs on the host.
-  release: v1.16
-  file: test/e2e/scheduling/predicates.go
-- testname: Scheduling, HostPort matching and HostIP and Protocol not-matching
-  codename: '[sig-scheduling] SchedulerPredicates [Serial] validates that there is
-    no conflict between pods with same hostPort but different hostIP and protocol
-    [LinuxOnly] [Conformance]'
-  description: Pods with the same HostPort value MUST be able to be scheduled to the
-    same node if the HostIP or Protocol is different. This test is marked LinuxOnly
-    since hostNetwork is not supported on Windows.
   release: v1.16
   file: test/e2e/scheduling/predicates.go
 - testname: Pod preemption verification

@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
@@ -91,11 +92,17 @@ type WeightedAffinityTerm struct {
 	Weight int32
 }
 
+// Diagnosis records the details to diagnose a scheduling failure.
+type Diagnosis struct {
+	NodeToStatusMap      NodeToStatusMap
+	UnschedulablePlugins sets.String
+}
+
 // FitError describes a fit error of a pod.
 type FitError struct {
-	Pod                   *v1.Pod
-	NumAllNodes           int
-	FilteredNodesStatuses NodeToStatusMap
+	Pod         *v1.Pod
+	NumAllNodes int
+	Diagnosis   Diagnosis
 }
 
 const (
@@ -106,7 +113,7 @@ const (
 // Error returns detailed information of why the pod failed to fit on each node
 func (f *FitError) Error() string {
 	reasons := make(map[string]int)
-	for _, status := range f.FilteredNodesStatuses {
+	for _, status := range f.Diagnosis.NodeToStatusMap {
 		for _, reason := range status.Reasons() {
 			reasons[reason]++
 		}
@@ -184,22 +191,22 @@ func NewPodInfo(pod *v1.Pod) *PodInfo {
 	}
 
 	// Attempt to parse the affinity terms
-	var parseErr error
+	var parseErrs []error
 	requiredAffinityTerms, err := getAffinityTerms(pod, schedutil.GetPodAffinityTerms(pod.Spec.Affinity))
 	if err != nil {
-		parseErr = fmt.Errorf("requiredAffinityTerms: %w", err)
+		parseErrs = append(parseErrs, fmt.Errorf("requiredAffinityTerms: %w", err))
 	}
 	requiredAntiAffinityTerms, err := getAffinityTerms(pod, schedutil.GetPodAntiAffinityTerms(pod.Spec.Affinity))
 	if err != nil {
-		parseErr = fmt.Errorf("requiredAntiAffinityTerms: %w", err)
+		parseErrs = append(parseErrs, fmt.Errorf("requiredAntiAffinityTerms: %w", err))
 	}
 	weightedAffinityTerms, err := getWeightedAffinityTerms(pod, preferredAffinityTerms)
 	if err != nil {
-		parseErr = fmt.Errorf("preferredAffinityTerms: %w", err)
+		parseErrs = append(parseErrs, fmt.Errorf("preferredAffinityTerms: %w", err))
 	}
 	weightedAntiAffinityTerms, err := getWeightedAffinityTerms(pod, preferredAntiAffinityTerms)
 	if err != nil {
-		parseErr = fmt.Errorf("preferredAntiAffinityTerms: %w", err)
+		parseErrs = append(parseErrs, fmt.Errorf("preferredAntiAffinityTerms: %w", err))
 	}
 
 	return &PodInfo{
@@ -208,7 +215,7 @@ func NewPodInfo(pod *v1.Pod) *PodInfo {
 		RequiredAntiAffinityTerms:  requiredAntiAffinityTerms,
 		PreferredAffinityTerms:     weightedAffinityTerms,
 		PreferredAntiAffinityTerms: weightedAntiAffinityTerms,
-		ParseError:                 parseErr,
+		ParseError:                 utilerrors.NewAggregate(parseErrs),
 	}
 }
 
@@ -562,7 +569,7 @@ func removeFromSlice(s []*PodInfo, k string) []*PodInfo {
 	for i := range s {
 		k2, err := GetPodKey(s[i].Pod)
 		if err != nil {
-			klog.Errorf("Cannot get pod key, err: %v", err)
+			klog.ErrorS(err, "Cannot get pod key", "pod", klog.KObj(s[i].Pod))
 			continue
 		}
 		if k == k2 {
@@ -591,7 +598,7 @@ func (n *NodeInfo) RemovePod(pod *v1.Pod) error {
 	for i := range n.Pods {
 		k2, err := GetPodKey(n.Pods[i].Pod)
 		if err != nil {
-			klog.Errorf("Cannot get pod key, err: %v", err)
+			klog.ErrorS(err, "Cannot get pod key", "pod", klog.KObj(n.Pods[i].Pod))
 			continue
 		}
 		if k == k2 {
